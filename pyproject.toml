@@ -1,0 +1,16 @@
+[project]
+name = "static-weight-cache"
+version = "0.1.0"
+description = "Standalone static host-memory weight cache prototype"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "pyzmq",
+]
+
+[project.optional-dependencies]
+safetensors = ["safetensors"]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
