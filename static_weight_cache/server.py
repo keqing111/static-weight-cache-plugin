@@ -146,17 +146,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metadata-port", type=int, default=0)
     parser.add_argument("--capacity-gb", type=float, default=8.0)
     parser.add_argument("--bucket-size-mb", type=int, default=1024)
-    parser.add_argument("--transfer-backend", default="mooncake")
+    parser.add_argument("--transfer-backend", default="tcp", choices=["tcp", "mooncake"])
     parser.add_argument("--transfer-protocol", default="tcp")
     parser.add_argument("--device-name", default="")
     parser.add_argument("--lock-memory", action="store_true")
-    parser.add_argument("--no-pin-memory", action="store_true")
+    parser.add_argument(
+        "--no-pin-memory",
+        action="store_true",
+        help="pageable pool; the cache then becomes reclaimable and the pool is no longer RDMA-registrable",
+    )
     return parser
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
+
+    transfer = TransferBackendConfig(
+        backend=args.transfer_backend,
+        protocol=args.transfer_protocol,
+        device_name=args.device_name,
+    )
+    # Pinned by default. The pool *is* the cache, so it must not be reclaimable;
+    # a pageable pool can be evicted under memory pressure and quietly turn into
+    # a miss. It is also the form an RDMA transport would need to register.
+    pin_memory = not args.no_pin_memory
+
     capacity_bytes = int(args.capacity_gb * (1 << 30))
     config = WeightCacheServerConfig(
         model_id=args.model_id,
@@ -167,14 +182,10 @@ def main() -> None:
         bucket_size_bytes=args.bucket_size_mb << 20,
         host_mem=HostMemConfig(
             capacity_bytes=capacity_bytes,
-            pin_memory=not args.no_pin_memory,
+            pin_memory=pin_memory,
             lock_memory=args.lock_memory,
         ),
-        transfer=TransferBackendConfig(
-            backend=args.transfer_backend,
-            protocol=args.transfer_protocol,
-            device_name=args.device_name,
-        ),
+        transfer=transfer,
     )
     server = WeightCacheServer(config)
     try:

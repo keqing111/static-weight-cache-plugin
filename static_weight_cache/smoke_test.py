@@ -82,7 +82,13 @@ def make_transfer_config(args: argparse.Namespace) -> TransferBackendConfig:
     )
 
 
+def resolve_pin_memory(args: argparse.Namespace) -> bool:
+    """Pinned by default: the pool is the cache and must not be reclaimable."""
+    return not args.no_pin_memory
+
+
 def make_server(args: argparse.Namespace) -> WeightCacheServer:
+    pin_memory = resolve_pin_memory(args)
     return WeightCacheServer(
         WeightCacheServerConfig(
             model_id=MODEL_ID,
@@ -92,7 +98,7 @@ def make_server(args: argparse.Namespace) -> WeightCacheServer:
             bucket_size_bytes=args.bucket_size_kb << 10,
             host_mem=HostMemConfig(
                 capacity_bytes=args.capacity_mb << 20,
-                pin_memory=args.pin_memory,
+                pin_memory=pin_memory,
                 lock_memory=args.lock_memory,
             ),
             transfer=make_transfer_config(args),
@@ -101,9 +107,15 @@ def make_server(args: argparse.Namespace) -> WeightCacheServer:
 
 
 def smoke_imports(_args: argparse.Namespace) -> None:
-    import mooncake.engine  # noqa: F401
+    # mooncake is only needed by the mooncake backend, so it is reported rather
+    # than required; the default TCP backend does not import it.
+    try:
+        import mooncake.engine  # noqa: F401
 
-    print_stage("import dependencies", True, "torch/zmq/mooncake")
+        have_mooncake = "mooncake"
+    except ImportError:
+        have_mooncake = "no mooncake"
+    print_stage("import dependencies", True, f"torch/zmq/{have_mooncake}")
 
 
 def smoke_memory(args: argparse.Namespace) -> None:
@@ -111,7 +123,7 @@ def smoke_memory(args: argparse.Namespace) -> None:
     mem = HostMemManager(
         HostMemConfig(
             capacity_bytes=args.capacity_mb << 20,
-            pin_memory=args.pin_memory,
+            pin_memory=resolve_pin_memory(args),
             lock_memory=args.lock_memory,
         )
     )
@@ -126,11 +138,11 @@ def smoke_memory(args: argparse.Namespace) -> None:
         mem.close()
 
 
-def smoke_mooncake_init(args: argparse.Namespace) -> None:
+def smoke_backend_init(args: argparse.Namespace) -> None:
     backend = build_transfer_backend(args.bind_ip, make_transfer_config(args))
     try:
         backend.start()
-        print_stage("mooncake transfer backend init", True, backend.peer_sid())
+        print_stage(f"{args.transfer_backend} transfer backend init", True, backend.peer_sid())
     finally:
         backend.close()
 
@@ -167,6 +179,10 @@ async def smoke_transfer(args: argparse.Namespace) -> None:
             bucket_size=args.bucket_size_kb << 10,
             transfer_config=make_transfer_config(args),
             recv_device="cpu",
+            # Without this the client follows the default route and can end up
+            # on a different NIC than the server, which the engine then cannot
+            # reach across the Ascend link.
+            local_ip=args.bind_ip,
         )
         actual = await collect_client_weights(client)
         compare_tensors(expected, actual)
@@ -182,8 +198,8 @@ async def run_smoke(args: argparse.Namespace) -> None:
         smoke_imports(args)
     if args.case in ("memory", "all"):
         smoke_memory(args)
-    if args.case in ("mooncake-init", "all"):
-        smoke_mooncake_init(args)
+    if args.case in ("backend-init", "mooncake-init", "all"):
+        smoke_backend_init(args)
     if args.case in ("metadata", "all"):
         smoke_metadata(args)
     if args.case in ("transfer", "all"):
@@ -192,15 +208,22 @@ async def run_smoke(args: argparse.Namespace) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run segmented static weight cache smoke tests")
-    parser.add_argument("--case", choices=["imports", "memory", "mooncake-init", "metadata", "transfer", "all"], default="all")
+    parser.add_argument("--case", choices=["imports", "memory", "backend-init", "metadata", "transfer", "all"], default="all")
     parser.add_argument("--bind-ip", default="127.0.0.1")
     parser.add_argument("--metadata-port", type=int, default=0)
     parser.add_argument("--capacity-mb", type=int, default=64)
     parser.add_argument("--bucket-size-kb", type=int, default=64)
-    parser.add_argument("--transfer-backend", default="mooncake")
+    parser.add_argument("--transfer-backend", default="tcp", choices=["tcp", "mooncake"])
     parser.add_argument("--transfer-protocol", default="tcp")
     parser.add_argument("--device-name", default="")
-    parser.add_argument("--pin-memory", action="store_true")
+    # Both default to unset, so the pool follows the transfer backend: pinned is
+    # only needed by mooncake, whose Ascend transport rejects anything it cannot
+    # classify. Override when you want to exercise a specific pool type.
+    parser.add_argument(
+        "--no-pin-memory",
+        action="store_true",
+        help="pageable pool; the cache then becomes reclaimable and the pool is no longer RDMA-registrable",
+    )
     parser.add_argument("--lock-memory", action="store_true")
     parser.add_argument("--query-timeout-ms", type=int, default=5000)
     return parser

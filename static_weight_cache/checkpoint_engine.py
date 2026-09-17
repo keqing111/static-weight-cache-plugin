@@ -39,10 +39,11 @@ class _StaticWeightCacheCheckpointEngine(CheckpointEngine):
         bucket_size: int,
         cache_endpoint: str,
         model_id: str,
-        transfer_backend: str = "mooncake",
+        transfer_backend: str = "tcp",
         transfer_protocol: str = "tcp",
         device_name: str = "",
         recv_device: str = "cpu",
+        local_ip: str | None = None,
         **_kwargs,
     ) -> None:
         self.client = StaticWeightCacheClient(
@@ -50,6 +51,7 @@ class _StaticWeightCacheCheckpointEngine(CheckpointEngine):
             model_id=model_id,
             bucket_size=bucket_size,
             recv_device=recv_device,
+            local_ip=local_ip,
             transfer_config=TransferBackendConfig(
                 backend=transfer_backend,
                 protocol=transfer_protocol,

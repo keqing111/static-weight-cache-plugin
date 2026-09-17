@@ -57,18 +57,37 @@ class StaticWeightCacheClient:
         bucket_size: int,
         transfer_config: TransferBackendConfig | None = None,
         recv_device: str = "cpu",
+        local_ip: str | None = None,
     ) -> None:
         self.cache_endpoint = cache_endpoint
         self.model_id = model_id
         self.bucket_size = bucket_size
         self.recv_device = recv_device
-        local_ip = get_local_ip()
+        # get_local_ip() follows the default route, which need not be the NIC we
+        # want the data plane on. Local-ip lookup is only a fallback.
+        self.local_ip = local_ip or get_local_ip()
         self.transfer_backend = build_transfer_backend(
-            local_ip,
+            self.local_ip,
             transfer_config or TransferBackendConfig(),
         )
         self.transfer_backend.start()
-        self.recv_buf = torch.empty(bucket_size, dtype=torch.uint8, device=recv_device)
+        self.recv_buf: torch.Tensor | None = None
+        self._recv_buf_is_registered = False
+        self._resize_recv_buf(bucket_size)
+
+    def _resize_recv_buf(self, capacity: int) -> None:
+        """Grow the landing buffer and register it with the transfer engine.
+
+        The engine can only write into memory it has registered, and on Ascend
+        hosts only pinned memory is accepted. Skipping this leaves the engine
+        with an unregistered destination and the read fails at connection time.
+        """
+        if self.recv_buf is not None and self.recv_buf.numel() >= capacity:
+            return
+        pinned = self.recv_device == "cpu"
+        self.recv_buf = torch.empty(capacity, dtype=torch.uint8, device=self.recv_device, pin_memory=pinned)
+        self.transfer_backend.register_regions([(int(self.recv_buf.data_ptr()), int(self.recv_buf.numel()))])
+        self._recv_buf_is_registered = True
 
     async def receive_weights(self, model_id: str | None = None) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
         target_model_id = model_id or self.model_id
@@ -84,8 +103,7 @@ class StaticWeightCacheClient:
         for bucket_idx in range(weight_info["bucket_num"]):
             capacity = int(weight_info["capacities"][bucket_idx])
             used_bytes = int(weight_info.get("used_bytes", weight_info["capacities"])[bucket_idx])
-            if capacity > self.recv_buf.numel():
-                self.recv_buf = torch.empty(capacity, dtype=torch.uint8, device=self.recv_device)
+            self._resize_recv_buf(capacity)
             self.transfer_backend.read(
                 peer_sid=peer_sid,
                 dst_ptr=int(self.recv_buf.data_ptr()),
@@ -137,9 +155,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-endpoint", required=True)
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--bucket-size-mb", type=int, default=1024)
-    parser.add_argument("--transfer-backend", default="mooncake")
+    parser.add_argument("--transfer-backend", default="tcp", choices=["tcp", "mooncake"])
     parser.add_argument("--transfer-protocol", default="tcp")
     parser.add_argument("--device-name", default="")
+    parser.add_argument("--local-ip", default=None, help="Local IP to bind the transfer engine to")
+    parser.add_argument("--recv-device", default="cpu")
     return parser
 
 
@@ -154,6 +174,8 @@ async def _main_async() -> None:
             protocol=args.transfer_protocol,
             device_name=args.device_name,
         ),
+        recv_device=args.recv_device,
+        local_ip=args.local_ip,
     )
     try:
         count = 0
