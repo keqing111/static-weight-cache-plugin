@@ -1,0 +1,23 @@
+# Legacy (V0 trainer) entry config for the dynamo rollout backend.
+#
+# Inherits ppo_trainer + dynamo_base. Pins trainer.use_v1=false: this preset
+# carries the V0-era defaults (DynamoAgentLoopManager, ThunderAgent on) which
+# violate the V1 TransferQueue contract — the V1 path lives in
+# dynamo_trainer_v1_colocate.yaml. verl.trainer.main_ppo dispatches on trainer.use_v1.
+
+hydra:
+  searchpath:
+    - pkg://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - dynamo_base
+  - _self_
+
+trainer:
+  use_v1: false
+
+actor_rollout_ref:
+  rollout:
+    agent:
+      agent_loop_manager_class: recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager

@@ -1,0 +1,12 @@
+# verl_tinker — rolling recipe refreshed against this exact upstream main commit
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=rolling
+BRANCH=main
+VERL_COMMIT=cfacd76a0bdd4540346f99588d3ab35b07f4fe6f
+PIP_INSTALL=uv sync --project verl_tinker --python python3.12
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout cfacd76a0bdd4540346f99588d3ab35b07f4fe6f && git submodule update --init --recursive recipe
+RECIPE_SUBMODULE_COMMIT=e44a9ca9a252322f76fe74753cc7afd812355b67
+RECIPE_FOLDER=verl_tinker
+RECIPE_FOLDER_LAST_COMMIT=e44a9ca9a252322f76fe74753cc7afd812355b67
+NOTES=MODE=rolling means this recipe follows upstream main over time; VERL_COMMIT pins the exact core verl commit tested for this refresh. PIP_INSTALL intentionally runs uv sync for the full Python 3.12 server runtime.
+REFRESH=Recompute: (cd verl && git rev-parse HEAD); (cd verl/recipe && git rev-parse HEAD); (cd verl/recipe && git log -1 --format=%H -- verl_tinker)

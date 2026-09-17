@@ -1,0 +1,923 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""CPU-only tests for the Dynamo × SGLang rollout backend.
+
+Deliberately avoids importing ``dynamo_sglang_rollout`` at module scope: that
+module pulls in verl's sglang ServerAdapter, which imports ``sglang`` and patches
+its engine entrypoint at import time. These tests run in the vLLM container too.
+"""
+
+import asyncio
+import base64
+import json
+from types import SimpleNamespace
+
+import pytest
+from recipe.dynamo.dynamo_async_server import DynamoHttpServer
+from recipe.dynamo.dynamo_sglang_engine import (
+    ROUTE_UPDATE_WEIGHTS_FROM_TENSOR,
+    DynamoSGLangControlClient,
+    DynamoSGLangControlError,
+)
+
+
+def _make_server(dynamo_cfg: dict | None = None, **rollout_cfg) -> DynamoHttpServer:
+    server = object.__new__(DynamoHttpServer)
+    cfg = {
+        "tensor_model_parallel_size": 1,
+        "gpu_memory_utilization": 0.5,
+        "max_model_len": 1024,
+        "max_num_batched_tokens": None,
+        "max_num_seqs": None,
+        "dtype": None,
+        "enforce_eager": False,
+        "enable_chunked_prefill": False,
+        "enable_prefix_caching": True,
+        "enable_sleep_mode": False,
+        "engine_kwargs": {"dynamo": dynamo_cfg if dynamo_cfg is not None else {}},
+    }
+    cfg.update(rollout_cfg)
+    server.config = SimpleNamespace(**cfg)
+    server.model_config = SimpleNamespace(local_path="/models/test-model", trust_remote_code=False)
+    server._engine_control_endpoints = []
+    server._control_endpoints = []
+    server._sglang_clients = None
+    return server
+
+
+# --------------------------------------------------------------------------- #
+# engine selection
+# --------------------------------------------------------------------------- #
+
+
+def test_engine_defaults_to_vllm():
+    assert _make_server()._engine_kind() == "vllm"
+    assert _make_server()._is_sglang() is False
+
+
+def test_engine_sglang_selected():
+    server = _make_server({"engine": "sglang"})
+    assert server._engine_kind() == "sglang"
+    assert server._is_sglang() is True
+
+
+def test_unknown_engine_rejected():
+    with pytest.raises(ValueError, match="must be one of"):
+        _make_server({"engine": "trtllm"})._engine_kind()
+
+
+# --------------------------------------------------------------------------- #
+# CLI mapping: vLLM flags -> SGLang ServerArgs flags
+# --------------------------------------------------------------------------- #
+
+
+def _cmd(dynamo_cfg=None, **rollout_cfg) -> list[str]:
+    cfg = {"engine": "sglang"}
+    cfg.update(dynamo_cfg or {})
+    server = _make_server(cfg, **rollout_cfg)
+    tp = server.config.tensor_model_parallel_size
+    return server._build_sglang_cmd("test-model", tp)
+
+
+def test_sglang_cmd_core_mapping():
+    cmd = _cmd(tensor_model_parallel_size=4, gpu_memory_utilization=0.7, max_model_len=2048)
+    assert cmd[1:3] == ["-m", "dynamo.sglang"]
+    # The whole point of the mapping table: none of the vLLM spellings survive.
+    for vllm_flag in (
+        "--tensor-parallel-size",
+        "--gpu-memory-utilization",
+        "--max-model-len",
+        "--max-num-seqs",
+        "--enable-prefix-caching",
+        "--enable-sleep-mode",
+        "--worker-extension-cls",
+    ):
+        assert vllm_flag not in cmd, f"{vllm_flag} leaked into the sglang command line"
+    assert cmd[cmd.index("--tp-size") + 1] == "4"
+    assert cmd[cmd.index("--mem-fraction-static") + 1] == "0.7"
+    assert cmd[cmd.index("--context-length") + 1] == "2048"
+    assert cmd[cmd.index("--model-path") + 1] == "/models/test-model"
+
+
+def test_sglang_cmd_inverted_flags():
+    """SGLang's radix cache and CUDA graph default ON, so the flags invert."""
+    on = _cmd(enable_prefix_caching=True, enforce_eager=False)
+    assert "--disable-radix-cache" not in on
+    assert "--disable-cuda-graph" not in on
+
+    off = _cmd(enable_prefix_caching=False, enforce_eager=True)
+    assert "--disable-radix-cache" in off
+    assert "--disable-cuda-graph" in off
+
+
+def test_sleep_mode_maps_to_memory_saver():
+    assert "--enable-memory-saver" in _cmd(enable_sleep_mode=True)
+    assert "--enable-memory-saver" not in _cmd(enable_sleep_mode=False)
+
+
+def test_enable_rl_on_by_default():
+    """Keep forwarding the worker's RL flag independently of native routes."""
+    assert "--enable-rl" in _cmd()
+    assert "--enable-rl" not in _cmd({"sglang": {"enable_rl": False}})
+
+
+def test_cache_flush_route_is_registered_without_extra_args():
+    for enable_rl in [True, False]:
+        cmd = _cmd({"sglang": {"enable_rl": enable_rl}})
+        assert cmd[cmd.index("--engine-route") + 1] == "flush_cache:tm"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--engine-route", "flush_cache:tm"],
+        ["--engine-route=flush_cache:tm"],
+        ["--engine-route", "flush_cache=custom_flush:tm"],
+    ],
+)
+def test_cache_flush_route_preserves_explicit_registration(extra):
+    cmd = _cmd({"sglang": {"extra_args": extra}})
+    assert sum(arg.startswith("--engine-route") for arg in cmd) == 1
+    assert cmd[-len(extra) :] == extra
+
+
+def test_other_engine_routes_do_not_disable_cache_flush():
+    cmd = _cmd({"sglang": {"extra_args": ["--engine-route", "get_load:tm"]}})
+    assert "flush_cache:tm" in cmd and "get_load:tm" in cmd
+
+
+def test_page_size_falls_back_to_thunderagent_block_size():
+    cmd = _cmd({"thunderagent": {"router_block_size": 32}})
+    assert cmd[cmd.index("--page-size") + 1] == "32"
+    # explicit sglang.page_size wins
+    cmd = _cmd({"sglang": {"page_size": 16}, "thunderagent": {"router_block_size": 32}})
+    assert cmd[cmd.index("--page-size") + 1] == "16"
+
+
+def test_attention_backend_defaults_to_flashinfer():
+    """Mirror verl's native sglang server: SGLang's Hopper default (fa3) decodes ~8%
+    slower per step with the router page size, and fa3 + cuda graph is broken on
+    sglang>=0.5.12. Explicit config or an extra_args flag must still win."""
+    cmd = _cmd()
+    assert cmd[cmd.index("--attention-backend") + 1] == "flashinfer"
+    cmd = _cmd({"sglang": {"attention_backend": "fa3"}})
+    assert cmd[cmd.index("--attention-backend") + 1] == "fa3"
+    cmd = _cmd({"sglang": {"extra_args": ["--attention-backend", "triton"]}})
+    assert cmd.count("--attention-backend") == 1
+    assert cmd[cmd.index("--attention-backend") + 1] == "triton"
+
+
+def test_sglang_cmd_publishes_kv_events_like_vllm():
+    """KV events feed the KV router's index. dynamo.sglang derives use_kv_events from
+    --kv-events-config alone (dynamo/sglang/args.py), so without the flag the router
+    only ever sees predict-on-route entries (100-step 30B run before 2026-09-09:
+    router-estimated prefix hit 0.865 vs engine-measured 0.627)."""
+    server = _make_server({"engine": "sglang"})
+    assert server._kv_events_enabled() is True
+    assert _make_server({"engine": "sglang", "enable_kv_events": False})._kv_events_enabled() is False
+    js = DynamoHttpServer._build_kv_events_config_json(5557)
+    # the JSON dynamo's own sglang docs use (docs/integrations/flexkv-integration.md)
+    assert json.loads(js) == {
+        "publisher": "zmq",
+        "topic": "kv-events",
+        "endpoint": "tcp://*:5557",
+        "enable_kv_cache_events": True,
+    }
+    cmd = server._build_sglang_cmd("test-model", 1, kv_events_config_json=js)
+    assert cmd[cmd.index("--kv-events-config") + 1] == js
+    # no config -> no flag (the worker then registers use_kv_events=False)
+    assert "--kv-events-config" not in server._build_sglang_cmd("test-model", 1)
+
+
+def test_vllm_cmd_kv_events_flag_follows_the_same_contract():
+    """enable_kv_events=false must reach the vLLM shard as *no* --kv-events-config, exactly
+    like the sglang builder; the launcher passes None in that case."""
+    server = _make_server({"engine": "vllm"})
+    js = DynamoHttpServer._build_kv_events_config_json(5557)
+    cmd = server._build_vllm_cmd("test-model", 1, kv_events_config_json=js)
+    assert cmd[cmd.index("--kv-events-config") + 1] == js
+    assert "--kv-events-config" not in server._build_vllm_cmd("test-model", 1)
+    assert "--kv-events-config" not in server._build_vllm_cmd("test-model", 1, kv_events_config_json=None)
+
+
+def _router_args(dynamo_cfg: dict, mode: str) -> list[str]:
+    server = _make_server(dynamo_cfg)
+    server._router_mode = mode
+    return server._frontend_router_args()
+
+
+def test_session_affinity_flag_off_by_default_and_in_every_router_mode():
+    for mode in ("kv", "round-robin"):
+        assert "--router-session-affinity-ttl-secs" not in _router_args({"engine": "sglang"}, mode)
+        args = _router_args({"engine": "sglang", "router_session_affinity_ttl_secs": 600}, mode)
+        assert args[args.index("--router-session-affinity-ttl-secs") + 1] == "600"
+    for off in (None, 0, "None", "null", ""):
+        cfg = {"engine": "sglang", "router_session_affinity_ttl_secs": off}
+        assert "--router-session-affinity-ttl-secs" not in _router_args(cfg, "kv")
+    with pytest.raises(ValueError):
+        _make_server({"engine": "sglang", "router_session_affinity_ttl_secs": "soon"})._session_affinity_ttl_secs()
+    with pytest.raises(ValueError):
+        _make_server({"engine": "sglang", "router_session_affinity_ttl_secs": 31_536_001})._session_affinity_ttl_secs()
+
+
+def test_session_header_only_when_affinity_configured():
+    assert _make_server({"engine": "sglang"})._frontend_headers("traj-1") == {"X-Request-Id": "traj-1"}
+    on = _make_server({"engine": "sglang", "router_session_affinity_ttl_secs": 600})._frontend_headers("traj-1")
+    assert on == {"X-Request-Id": "traj-1", "x-dynamo-session-id": "traj-1"}
+
+
+def test_extra_args_forwarded():
+    cmd = _cmd({"sglang": {"extra_args": ["--schedule-policy", "fcfs"]}})
+    assert cmd[-2:] == ["--schedule-policy", "fcfs"]
+
+
+# --------------------------------------------------------------------------- #
+# control-plane invariants
+# --------------------------------------------------------------------------- #
+
+
+def test_sglang_requires_system_port():
+    """DYN_SYSTEM_PORT is the sglang control plane, not an optional metrics extra."""
+    server = _make_server({"engine": "sglang", "enable_worker_system_metrics": False})
+    server.replica_rank = 0
+    server.node_rank = 0
+    server._cuda_visible_devices = "0"
+    server._worker_specs = None
+    with pytest.raises(ValueError, match="requires enable_worker_system_metrics"):
+        server._start_engine_workers()
+
+
+def test_num_engine_workers_counts_sglang_shards():
+    server = _make_server({"engine": "sglang"}, tensor_model_parallel_size=2)
+    server._engine_control_endpoints = ["http://h:11000", "http://h:11001"]
+    assert server.get_num_engine_workers() == 4
+
+
+# --------------------------------------------------------------------------- #
+# shard mapping — the silent-corruption guard
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("local_world_size,tp", [(8, 1), (8, 2), (8, 4), (8, 8), (4, 2)])
+def test_trainer_shard_index_matches_launcher_gpu_slicing(local_world_size, tp):
+    """Every trainer rank must resolve to the shard that owns its GPU.
+
+    The launcher (``_start_engine_workers``) gives shard *i* the GPU slice
+    ``cvd[i*tp:(i+1)*tp]``. The adapter computes ``shard = local_rank // tp``.
+    If those two ever drift, weight sync posts CUDA-IPC handles to an engine on a
+    different GPU — which does not raise, it just trains against wrong weights.
+    """
+    cvd = [str(i) for i in range(local_world_size)]
+    n_shards = local_world_size // tp
+    launcher_owner = {}
+    for shard_idx in range(n_shards):
+        for gpu in cvd[shard_idx * tp : (shard_idx + 1) * tp]:
+            launcher_owner[gpu] = shard_idx
+
+    for local_rank in range(local_world_size):
+        adapter_shard = local_rank // tp  # SGLangServerAdapter._shard_idx_local
+        assert adapter_shard == launcher_owner[str(local_rank)]
+        assert 0 <= adapter_shard < n_shards
+
+
+def test_tp_group_ranks_are_contiguous_and_tp_aligned():
+    """The shard TP process group is [k*tp, (k+1)*tp) over global ranks."""
+    world_size, tp = 16, 4
+    groups = [list(range(base, base + tp)) for base in range(0, world_size, tp)]
+    assert len(groups) == world_size // tp
+    assert [r for g in groups for r in g] == list(range(world_size))
+    for rank in range(world_size):
+        owning = [g for g in groups if rank in g]
+        assert len(owning) == 1
+        assert owning[0][0] == (rank // tp) * tp
+
+
+# --------------------------------------------------------------------------- #
+# control client
+# --------------------------------------------------------------------------- #
+
+
+class _FakeResponse:
+    def __init__(self, status, payload):
+        self.status = status
+        self._payload = payload
+
+    async def text(self):
+        import json
+
+        return json.dumps(self._payload)
+
+    async def json(self, content_type=None):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, status=200, payload=None):
+        self.status = status
+        self.payload = payload if payload is not None else {"status": "ok"}
+        self.calls = []
+        self.closed = False
+
+    def post(self, url, json=None, timeout=None):
+        self.calls.append((url, json))
+        return _FakeResponse(self.status, self.payload)
+
+
+def _client(session, **kwargs):
+    client = DynamoSGLangControlClient("http://worker:11000", **kwargs)
+    client._session = session
+    return client
+
+
+def test_route_url_shape():
+    client = DynamoSGLangControlClient("http://worker:11000/")
+    assert client.route_url("release_memory_occupation") == ("http://worker:11000/engine/release_memory_occupation")
+
+
+@pytest.mark.asyncio
+async def test_update_weights_from_tensor_base64_encodes():
+    session = _FakeSession(payload={"success": True, "message": "ok"})
+    client = _client(session)
+    blobs = [b"\x00\x01\xff-not-utf8", b"second"]
+    req = SimpleNamespace(serialized_named_tensors=blobs, load_format=None, flush_cache=False)
+
+    await client.update_weights_from_tensor(req)
+
+    url, body = session.calls[0]
+    assert url.endswith(f"/engine/{ROUTE_UPDATE_WEIGHTS_FROM_TENSOR}")
+    # JSON has no bytes; the wire form must be b64 and must round-trip exactly.
+    assert [base64.b64decode(v) for v in body["serialized_named_tensors"]] == blobs
+    assert body["flush_cache"] is False
+
+
+@pytest.mark.asyncio
+async def test_update_weights_survives_full_byte_range():
+    """Every byte value must round-trip: a payload SGLang cannot deserialize does not
+    return an error, it kills the worker process (M0c, job 16215105)."""
+    session = _FakeSession(payload={"success": True})
+    client = _client(session)
+    blob = bytes(range(256))
+    req = SimpleNamespace(serialized_named_tensors=[blob], load_format=None, flush_cache=True)
+
+    await client.update_weights_from_tensor(req)
+
+    _, body = session.calls[0]
+    assert base64.b64decode(body["serialized_named_tensors"][0]) == blob
+
+
+@pytest.mark.asyncio
+async def test_error_status_body_raises():
+    """A 200 with {"status": "error"} must not be mistaken for success."""
+    client = _client(_FakeSession(payload={"status": "error", "message": "memory control not supported"}))
+    with pytest.raises(DynamoSGLangControlError, match="memory control not supported"):
+        await client.release_memory_occupation(tags=["kv_cache"])
+
+
+@pytest.mark.asyncio
+async def test_success_false_body_raises():
+    client = _client(_FakeSession(payload={"success": False, "message": "deserialize failed"}))
+    req = SimpleNamespace(serialized_named_tensors=[b"x"], load_format=None, flush_cache=False)
+    with pytest.raises(DynamoSGLangControlError, match="deserialize failed"):
+        await client.update_weights_from_tensor(req)
+
+
+@pytest.mark.asyncio
+async def test_http_error_raises():
+    client = _client(_FakeSession(status=404, payload={"error": "not found"}))
+    with pytest.raises(DynamoSGLangControlError, match="HTTP 404"):
+        await client.flush_cache()
+
+
+@pytest.mark.asyncio
+async def test_flush_cache_uses_explicit_native_route():
+    """PR13951 requires an explicitly configured native flush route."""
+    session = _FakeSession()
+    client = _client(session)
+    await client.flush_cache()
+    url, body = session.calls[0]
+    assert url.endswith("/engine/flush_cache")
+    assert body == {}
+
+
+@pytest.mark.asyncio
+async def test_memory_occupation_tags_passed_through():
+    session = _FakeSession()
+    client = _client(session)
+    await client.release_memory_occupation(tags=["kv_cache", "weights"])
+    assert session.calls == [
+        ("http://worker:11000/engine/pause_generation", {"mode": "abort"}),
+        ("http://worker:11000/engine/release_memory_occupation", {"tags": ["kv_cache", "weights"]}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_memory_restore_precedes_generation_and_discovery_resume():
+    session = _FakeSession()
+    client = _client(session)
+    await client.resume_memory_occupation(tags=["kv_cache", "weights"])
+    assert session.calls == [
+        ("http://worker:11000/engine/resume_memory_occupation", {"tags": ["kv_cache", "weights"]}),
+        ("http://worker:11000/engine/continue_generation", {}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_memory_restore_keeps_generation_paused():
+    session = _FakeSession(payload={"success": False, "message": "restore failed"})
+    client = _client(session)
+    with pytest.raises(DynamoSGLangControlError, match="restore failed"):
+        await client.resume_memory_occupation(tags=["kv_cache", "weights"])
+    assert [url for url, _ in session.calls] == ["http://worker:11000/engine/resume_memory_occupation"]
+
+
+@pytest.mark.asyncio
+async def test_failed_pause_prevents_memory_release():
+    session = _FakeSession(status=500, payload={"error": "pause failed"})
+    client = _client(session)
+    with pytest.raises(DynamoSGLangControlError, match="HTTP 500"):
+        await client.release_memory_occupation(tags=["kv_cache"])
+    assert [url for url, _ in session.calls] == ["http://worker:11000/engine/pause_generation"]
+
+
+@pytest.mark.asyncio
+async def test_ready_probes_the_native_flush_route():
+    session = _FakeSession()
+    client = _client(session)
+    assert await client.wait_ready(timeout_s=1, poll_s=0)
+    assert session.calls == [("http://worker:11000/engine/flush_cache", {})]
+
+
+# --------------------------------------------------------------------------- #
+# release/resume tag symmetry — regression for the M2 scheduler kill
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# shard index must come from the GLOBAL rank — regression for the TP=2 silent bug
+# --------------------------------------------------------------------------- #
+
+
+def _verl_replica_local_rank(global_rank: int, tp: int, dp: int = 1, pp: int = 1) -> int:
+    """Reproduce verl sglang ServerAdapter's local_rank (see sglang_rollout.py).
+
+    rollout_world_size = tp * dp * pp; rollout_rank = rank % rollout_world_size;
+    local_rank = rollout_rank % local_world_size. The key property: it is
+    REPLICA-relative, so it never exceeds the replica's world size.
+    """
+    rollout_world_size = tp * dp * pp
+    return global_rank % rollout_world_size
+
+
+@pytest.mark.parametrize("local_world_size,tp", [(8, 2), (8, 4), (4, 2)])
+def test_shard_index_uses_global_rank_not_replica_local_rank(local_world_size, tp):
+    """Deriving the shard from verl's local_rank collapses every rank onto shard 0.
+
+    Observed on 8xH100 TP=2 (job 16232079): all eight ranks logged shard=0 while
+    four shards were registered, so every rank posted its CUDA-IPC handles to
+    shard 0 and the other three engines kept stale weights. Nothing raised.
+    At tp=1 the wrong formula happens to give the right answer, which is why six
+    earlier green runs never caught it.
+    """
+    n_shards = local_world_size // tp
+    shards_from_global = set()
+    shards_from_replica_local = set()
+    for global_rank in range(local_world_size):
+        node_local = global_rank % local_world_size
+        shards_from_global.add(node_local // tp)
+        shards_from_replica_local.add(_verl_replica_local_rank(global_rank, tp) // tp)
+
+    assert shards_from_global == set(range(n_shards)), "global-rank derivation must cover every shard"
+    # The buggy derivation cannot reach past shard 0 whenever tp == replica width.
+    assert shards_from_replica_local == {0}
+    assert len(shards_from_global) > 1, "parametrisation must actually exercise >1 shard"
+
+
+def test_single_shard_hides_the_bug_regardless_of_tp():
+    """Pin down what actually hid the bug: ONE shard, not tp=1.
+
+    The first explanation ("tp=1 makes both formulas agree") was wrong, and this
+    test caught it. At tp=1 verl's rollout_world_size is 1, so its local_rank is 0
+    for *every* rank — the buggy formula collapses to shard 0 there too. It only
+    looked correct because the earlier runs used a single GPU, where shard 0 is the
+    only shard that exists. An 8-GPU tp=1 run (8 shards) would have failed just as
+    the tp=2 run did.
+    """
+    # one GPU -> one shard: both formulas trivially agree, bug invisible
+    for tp in (1,):
+        assert (0 % 1) // tp == _verl_replica_local_rank(0, tp) // tp
+
+    # 8 GPUs, tp=1 -> 8 shards: the buggy formula still collapses to shard 0
+    local_world_size, tp = 8, 1
+    buggy = {_verl_replica_local_rank(r, tp) // tp for r in range(local_world_size)}
+    correct = {(r % local_world_size) // tp for r in range(local_world_size)}
+    assert buggy == {0}, "verl local_rank is 0 for every rank when tp*dp*pp == 1"
+    assert correct == set(range(8))
+
+
+@pytest.mark.parametrize("local_world_size,tp", [(8, 2), (8, 4), (8, 8), (4, 2)])
+def test_shard_and_tp_group_agree(local_world_size, tp):
+    """The shard a rank talks to must own the GPUs of its TP group."""
+    for global_rank in range(local_world_size):
+        node_local = global_rank % local_world_size
+        shard = node_local // tp
+        tp_group_src = (global_rank // tp) * tp
+        # the TP group's first rank must sit at the start of that shard's GPU slice
+        assert tp_group_src % local_world_size == shard * tp
+
+
+# --------------------------------------------------------------------------- #
+# engine dispatch lives in ONE place (rollout.name=dynamo + engine=...)
+# --------------------------------------------------------------------------- #
+
+
+def test_engine_dispatch_reads_config_not_rollout_name():
+    """Selecting the engine must be a single config key, like every other verl backend.
+
+    An earlier revision registered a second rollout name (``dynamo_sglang``) with its
+    own trainer yaml and entry point, so the choice had to be repeated in three
+    places that could disagree — and the extra name silently missed verl's own
+    ``rollout.name == "sglang"`` special-cases.
+    """
+    from recipe.dynamo.dynamo_rollout import _dynamo_engine
+
+    assert _dynamo_engine(None) == "vllm"
+    assert _dynamo_engine(SimpleNamespace(engine_kwargs=None)) == "vllm"
+    assert _dynamo_engine(SimpleNamespace(engine_kwargs={})) == "vllm"
+    assert _dynamo_engine(SimpleNamespace(engine_kwargs={"dynamo": {}})) == "vllm"
+    assert _dynamo_engine(SimpleNamespace(engine_kwargs={"dynamo": {"engine": "sglang"}})) == "sglang"
+
+
+def test_registry_exposes_exactly_one_dynamo_name():
+    """No second rollout name for the sglang engine."""
+    import recipe.dynamo.register  # noqa: F401  (registers on import)
+
+    from verl.workers.rollout.base import _ROLLOUT_REGISTRY
+
+    dynamo_names = {name for (name, _mode) in _ROLLOUT_REGISTRY if name.startswith("dynamo")}
+    assert dynamo_names == {"dynamo"}, f"unexpected dynamo rollout names: {dynamo_names}"
+
+
+@pytest.mark.parametrize("nnodes,local_world_size,tp", [(2, 8, 2), (2, 8, 4), (4, 8, 2)])
+def test_node_rank_uses_global_rank_not_replica_relative(nnodes, local_world_size, tp):
+    """Every rank must resolve the DynamoHttpServer actor on ITS OWN node.
+
+    verl's node_rank is rollout_rank // local_world_size with
+    rollout_rank = rank % (tp*dp*pp); for tp<local_world_size that inner value
+    never reaches local_world_size, so node_rank collapses to 0 and every rank on
+    every node targets node 0's actor. Ranks on other nodes then post CUDA-IPC
+    handles for their own GPUs to node 0's engines, and sglang rejects them with
+    "Invalid device_uuid=..." while killing the scheduler (observed on 2x8 H100,
+    job 16253641). Invisible on one node, where 0 is the only right answer.
+    """
+    world = nnodes * local_world_size
+    correct = {r: r // local_world_size for r in range(world)}
+    buggy = {r: _verl_replica_local_rank(r, tp) // local_world_size for r in range(world)}
+
+    assert set(correct.values()) == set(range(nnodes)), "global derivation must span all nodes"
+    assert set(buggy.values()) == {0}, "the replica-relative form cannot leave node 0"
+    for r in range(world):
+        # the actor a rank talks to must own the GPU that rank runs on
+        assert correct[r] == r // local_world_size
+
+
+def test_missing_token_ids_is_loud_not_silent(caplog):
+    """The 1-token fallback must announce itself.
+
+    Regression for the failure that cost a full 2-node 30B retool run (job
+    16270139): the frontend returned text but no token ids, so every sample was
+    scored as a single EOS. response_length/mean==1.0, grad_norm==0, reward
+    pinned at its floor — and the job exited 0 with a complete metric set. The
+    text in the rollout dump was 2384 characters of coherent reasoning, which is
+    what finally separated "generation is broken" from "the length accounting is
+    broken". Nothing in the logs distinguished the two for three wrong
+    hypotheses, so silence here is the actual defect.
+    """
+    server = DynamoHttpServer.__new__(DynamoHttpServer)
+    server.model_config = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=151645))
+
+    with caplog.at_level("ERROR"):
+        token_ids = server._fallback_token_ids()
+
+    assert token_ids == [151645]
+    assert "NO TOKEN IDS" in caplog.text
+    assert "request_completion_token_ids" in caplog.text, (
+        "the log must name the flag that fixes it, not merely report the symptom"
+    )
+
+
+def _completion_response(token_ids, usage_tokens, finish_reason="stop"):
+    return {
+        "choices": [{"text": "4", "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": usage_tokens},
+        "nvext": {"completion_token_ids": list(token_ids)},
+    }
+
+
+def _token_output_server():
+    server = _make_server({"engine": "sglang", "request_completion_token_ids": True})
+    server.model_config.tokenizer = SimpleNamespace(eos_token_id=151645, pad_token_id=151643)
+    # instance state that __init__ normally sets and the response path reads
+    server._logged_engine_data_token_ids = False
+    server._logged_missing_engine_data = False
+    server.global_steps = 0
+    return server
+
+
+def test_token_count_mismatch_is_loud():
+    """Guard for ai-dynamo/dynamo#14302 (dynamo>=1.4.1 strips the stop token from
+    completion_token_ids while usage still counts it). Off by one here means the
+    trainer never sees EOS and nothing else in the metrics says so."""
+    server = _token_output_server()
+    out = server._completion_response_to_token_output(_completion_response([19, 151645], 2))
+    assert list(out.token_ids) == [19, 151645]
+    with pytest.raises(RuntimeError, match="14302"):
+        server._completion_response_to_token_output(_completion_response([19], 2))
+    # aborted responses are legitimately partial -- no guard
+    out = server._completion_response_to_token_output(_completion_response([19], 2, finish_reason="abort"))
+    assert list(out.token_ids) == [19]
+    # no usage in the response -> nothing to compare against
+    resp = _completion_response([19], 2)
+    del resp["usage"]
+    assert list(server._completion_response_to_token_output(resp).token_ids) == [19]
+
+
+def test_fallback_keeps_logging_on_a_long_run(caplog):
+    """Log the first few hits and then periodically — never just once.
+
+    A single line at hit #1 scrolls away in minutes on a 100-step run and the
+    remaining thousands of corrupted samples look clean.
+    """
+    server = DynamoHttpServer.__new__(DynamoHttpServer)
+    server.model_config = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=0))
+
+    with caplog.at_level("ERROR"):
+        for _ in range(205):
+            server._fallback_token_ids()
+
+    assert server._fallback_token_id_hits == 205
+    # 3 early + hits 100 and 200
+    assert caplog.text.count("NO TOKEN IDS") == 5
+
+
+@pytest.mark.parametrize("level", [1, 2])
+def test_sleep_frees_weights_at_every_level(level, monkeypatch):
+    """vLLM sleep(level=1) already takes weights off the GPU, so the sglang
+    equivalent must release BOTH tags.
+
+    Regression for the OOM in job 16280143: mapping level 1 -> ["kv_cache"] left
+    ~31 GB of TP=2 Qwen3-30B weights resident on each H100 through the training
+    step, and the trainer's FSDP forward died with 92 MiB free
+    (48.0 GiB trainer + 30.9 GiB engine on 79.1 GiB). The two APIs use different
+    vocabularies for the same thing; matching them by label instead of by effect
+    on GPU memory is what produced the bug.
+    """
+    server = DynamoHttpServer.__new__(DynamoHttpServer)
+    released = []
+
+    async def fake_release(tags):
+        released.append(list(tags))
+
+    monkeypatch.setattr(server, "_is_sglang", lambda: True, raising=False)
+    monkeypatch.setattr(server, "_free_engine_on_train", lambda: True, raising=False)
+    monkeypatch.setattr(server, "sglang_release", fake_release, raising=False)
+
+    asyncio.run(server.sleep(level=level))
+
+    assert released == [["kv_cache", "weights"]], (
+        f"level={level} must free weights; leaving them resident OOMs the trainer"
+    )
+
+
+class _FakeControlClient:
+    """Stand-in for DynamoSGLangControlClient: records calls, can fail on demand."""
+
+    def __init__(self, idx: int):
+        self.base_url = f"http://shard{idx}"
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+        self.fail_next: dict[str, int] = {}
+
+    async def _call(self, method, tags):
+        await asyncio.sleep(0)  # force a yield, as the real HTTP fan-out does
+        self.calls.append((method, tuple(tags)))
+        if self.fail_next.get(method, 0) > 0:
+            self.fail_next[method] -= 1
+            raise RuntimeError(f"{self.base_url} {method} failed")
+        return {"success": True}
+
+    async def release_memory_occupation(self, tags):
+        return await self._call("release_memory_occupation", tags)
+
+    async def resume_memory_occupation(self, tags):
+        return await self._call("resume_memory_occupation", tags)
+
+
+def _server_with_shards(n: int = 1, released: set[str] | None = None) -> DynamoHttpServer:
+    server = DynamoHttpServer.__new__(DynamoHttpServer)
+    server._sglang_clients = [_FakeControlClient(i) for i in range(n)]
+    server._engine_control_endpoints = [c.base_url for c in server._sglang_clients]
+    server._sglang_released_by_shard = None if released is None else [set(released) for _ in range(n)]
+    server._sglang_released_tags = set(released or ())
+    server._sglang_tag_lock = None
+    return server
+
+
+def test_release_is_idempotent_per_tag():
+    """A second release of a still-released tag must not reach the engine.
+
+    Regression for job 16283764. verl releases before every weight sync but
+    resumes "weights" and "kv_cache" at different points, so the real trace was:
+
+        released ['kv_cache','weights']   -> released={kv_cache, weights}
+        resumed  ['weights']              -> released={kv_cache}
+        released ['kv_cache','weights']   -> kv_cache released a SECOND time
+
+    Double-releasing under torch_memory_saver unbinds an already-unbound region,
+    and the pool's storage stops being GPU-backed. The failure then surfaces three
+    layers away as HTTP 500 "Failed to fold completions stream", with a Triton
+    "cpu tensor?" ValueError in the shard log and nothing naming memory release.
+    """
+    server = _server_with_shards(1)
+
+    # One event loop for the whole sequence: the lock is created lazily and binds
+    # to the loop it was made in, which is exactly how the Ray async actor runs it.
+    async def main():
+        await server.sglang_release(["kv_cache", "weights"])
+        await server.sglang_resume(["weights"])
+        await server.sglang_release(["kv_cache", "weights"])
+
+    asyncio.run(main())
+
+    assert server._sglang_clients[0].calls == [
+        ("release_memory_occupation", ("kv_cache", "weights")),
+        ("resume_memory_occupation", ("kv_cache", "weights")),  # widened
+        ("release_memory_occupation", ("kv_cache", "weights")),
+    ]
+    assert server._sglang_released_tags == {"kv_cache", "weights"}
+
+
+def test_release_and_resume_guards_are_symmetric():
+    """Both directions filter against the same state.
+
+    The resume guard was added first (for a KeyError that killed the scheduler)
+    and the release guard was not — one bug fixed, its sibling left in place.
+    This asserts the pair, so neither can regress alone.
+    """
+    server = _server_with_shards(1)
+    calls = server._sglang_clients[0].calls
+
+    async def main():
+        await server.sglang_resume(["weights"])  # never released -> no call
+        assert calls == []
+        await server.sglang_release(["weights"])
+        await server.sglang_release(["weights"])  # already released -> no call
+
+    asyncio.run(main())
+    assert [m for m, _ in calls] == ["release_memory_occupation"]
+
+
+def test_concurrent_release_reaches_engine_once():
+    """Concurrent callers must not each perform the release.
+
+    Root cause of the sglang arm's HTTP 500 storm (jobs 16283764 / 16439516).
+    Every shard adapter on a node calls sglang_release/resume in parallel, and a
+    Ray async actor runs them on one event loop. The tag filter alone is a
+    check-then-act across an await, so all four coroutines passed the check
+    before any wrote back the state — the log showed four "resumed ['weights']"
+    lines in the same millisecond, each still reporting weights as released.
+
+    Four real release_memory_occupation calls unbind an already-unbound region in
+    torch_memory_saver, and the next prefill dies in a Triton kernel with
+    "Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)".
+    """
+    server = _server_with_shards(1)
+
+    async def main():
+        await asyncio.gather(*[server.sglang_release(["kv_cache", "weights"]) for _ in range(4)])
+        await asyncio.gather(*[server.sglang_resume(["weights"]) for _ in range(4)])
+
+    asyncio.run(main())
+
+    assert server._sglang_clients[0].calls == [
+        ("release_memory_occupation", ("kv_cache", "weights")),
+        # widened: a partial resume would put the shard back in the routing pool
+        # with its kv_cache still released
+        ("resume_memory_occupation", ("kv_cache", "weights")),
+    ]
+    assert server._sglang_released_tags == set()
+
+
+def test_partial_resume_is_widened_to_every_released_tag():
+    """A weights-only resume must also restore kv_cache.
+
+    Dynamo's sglang handler re-registers the shard into discovery on the first
+    resume. verl resumes "weights" before the weight sync and "kv_cache" only
+    after it, so a faithful partial resume advertises a shard whose KV pool is
+    still released. Job 16441143 spent ~9 s in that state and the scheduler died
+    in write_req_to_token_pool_triton with "cpu tensor?", surfacing to the trainer
+    as 257 unexplained HTTP 500s.
+    """
+    server = _server_with_shards(1, released={"kv_cache", "weights"})
+    asyncio.run(server.sglang_resume(["weights"]))
+
+    assert server._sglang_clients[0].calls == [("resume_memory_occupation", ("kv_cache", "weights"))]
+    assert server._sglang_released_tags == set()
+
+
+def test_partial_fanout_failure_is_tracked_per_shard():
+    """A release that fails on one shard must not be re-sent to the shards it reached.
+
+    The engine state is per shard; an all-or-nothing node-level record would leave
+    the successful shards marked "not released" and the retry would release them a
+    second time — the same torch_memory_saver double-unbind as the idempotency test,
+    reached through a transient HTTP failure instead of a resume ordering quirk.
+    """
+    server = _server_with_shards(4)
+    server._sglang_clients[3].fail_next["release_memory_occupation"] = 1
+
+    async def main():
+        with pytest.raises(RuntimeError, match="failed on shard"):
+            await server.sglang_release(["kv_cache", "weights"])
+        # shards 0-2 succeeded and are recorded; only shard 3 is still resident
+        assert [len(c.calls) for c in server._sglang_clients] == [1, 1, 1, 1]
+        assert server._sglang_released_by_shard[0] == {"kv_cache", "weights"}
+        assert server._sglang_released_by_shard[3] == set()
+        # retry touches ONLY the failed shard
+        await server.sglang_release(["kv_cache", "weights"])
+        assert [len(c.calls) for c in server._sglang_clients] == [1, 1, 1, 2]
+        assert all(s == {"kv_cache", "weights"} for s in server._sglang_released_by_shard)
+        # resume fans out to every shard exactly once and clears them all
+        await server.sglang_resume(["weights"])
+        assert [c.calls[-1] for c in server._sglang_clients] == [
+            ("resume_memory_occupation", ("kv_cache", "weights"))
+        ] * 4
+        assert server._sglang_released_tags == set()
+
+    asyncio.run(main())
+
+
+def test_sglang_refuses_memory_saver_flag_split():
+    """free_cache_engine=true with enable_sleep_mode=false must be rejected at launch.
+
+    --enable-memory-saver follows enable_sleep_mode, the adapter's release calls
+    follow free_cache_engine. Split, release_memory_occupation still deregisters the
+    worker from discovery but frees nothing, and the trainer OOMs with no log line
+    naming the cause.
+    """
+    server = _make_server(
+        {"engine": "sglang", "request_completion_token_ids": True},
+        enable_sleep_mode=False,
+        free_cache_engine=True,
+    )
+    server.replica_rank = 0
+    server.node_rank = 0
+    server._cuda_visible_devices = "0"
+    server._worker_specs = None
+    with pytest.raises(ValueError, match="enable_sleep_mode"):
+        server._start_engine_workers()
+
+
+def test_facade_imports_without_vllm(monkeypatch):
+    """recipe.dynamo.dynamo_rollout must import on a vLLM-free image.
+
+    rollout.name=dynamo resolves through this one module for BOTH engines, so a
+    hard top-level `from verl...vllm_rollout import ServerAdapter` makes the
+    sglang path unusable on the official verlai/verl:sgl* images — verl's
+    vllm_rollout/__init__.py raises PackageNotFoundError (not ImportError) when
+    vLLM is absent. Job 16510923 died that way after a fully healthy bootstrap.
+    """
+    import importlib.metadata
+    import sys
+
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def no_vllm(name, *args, **kwargs):
+        if name.startswith("verl.workers.rollout.vllm_rollout"):
+            raise importlib.metadata.PackageNotFoundError("vllm missing (simulated)")
+        return real_import(name, *args, **kwargs)
+
+    for mod in [m for m in sys.modules if m.startswith("recipe.dynamo.dynamo_rollout")]:
+        del sys.modules[mod]
+    monkeypatch.setattr("builtins.__import__", no_vllm)
+
+    mod = importlib.import_module("recipe.dynamo.dynamo_rollout")
+    assert mod.ServerAdapter is not None
+    # the vLLM subclass still exists, but instantiating it must say why it cannot work
+    with pytest.raises(RuntimeError, match="needs the vLLM package"):
+        mod.VllmDynamoServerAdapter()

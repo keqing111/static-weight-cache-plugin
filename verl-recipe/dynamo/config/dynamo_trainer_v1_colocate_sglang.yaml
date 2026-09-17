@@ -1,0 +1,49 @@
+# V1 colocate_async entry config for the dynamo rollout backend, sglang engine.
+#
+# Same trainer shape as dynamo_trainer_v1_colocate.yaml; the deltas are the
+# sglang engine selection plus the three switches sglang hard-requires:
+#   * enable_sleep_mode=true      -> --enable-memory-saver (colocate sleeps the
+#                                    engine every step; release/resume_memory_
+#                                    occupation refuses to work without it)
+#   * request_completion_token_ids -> sglang refuses to start when this is
+#                                    left unset (no engine_data channel; token
+#                                    ids must come via nvext.completion_token_ids)
+#   * enable_worker_system_metrics -> that port carries sglang's entire
+#                                    /engine/control/* plane
+#
+# Environment: the dynamo install must carry the #11640 incremental-logprobs
+# backport (no stable PyPI release has it), and PYTORCH_CUDA_ALLOC_CONF must
+# be UNSET (torch_memory_saver is incompatible with it).
+
+hydra:
+  searchpath:
+    - pkg://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - dynamo_base
+  - _self_
+
+trainer:
+  use_v1: true
+  v1:
+    trainer_mode: colocate_async
+    colocate_async:
+      num_warmup_batches: 1
+
+transfer_queue:
+  enable: true
+
+actor_rollout_ref:
+  rollout:
+    free_cache_engine: true
+    enable_sleep_mode: true
+    agent:
+      agent_loop_manager_class: null
+    engine_kwargs:
+      dynamo:
+        engine: sglang
+        request_completion_token_ids: true
+        enable_worker_system_metrics: true
+        thunderagent:
+          enabled: false

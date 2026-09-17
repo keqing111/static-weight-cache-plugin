@@ -1,0 +1,6 @@
+# Dynamo rollout backend (vLLM + SGLang engines) — tested core verl commit.
+# The launchers pass trainer.use_v1=False, which does not exist on older commits.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=pinned_commit
+COMMIT=6cbca9ce7208100d11b4d1b06eccf098cc9e76aa
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@6cbca9ce7208100d11b4d1b06eccf098cc9e76aa

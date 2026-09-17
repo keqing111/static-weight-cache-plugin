@@ -1,0 +1,51 @@
+# Shared dynamo-backend deltas over ppo_trainer. This fragment must stay free
+# of any `hydra:` block: hydra.searchpath is only legal in the PRIMARY config,
+# and this file is included from multiple primary entry configs
+# (dynamo_trainer.yaml and the dynamo_trainer_v1_* presets).
+#
+# Anything dynamo-specific (router_mode, frontend_http_port, namespace, etc.)
+# lives under actor_rollout_ref.rollout.engine_kwargs.dynamo and is parsed
+# inside DynamoHttpServer (see dynamo_async_server.py:_dynamo_cfg).
+
+actor_rollout_ref:
+  rollout:
+    name: dynamo
+    mode: async
+    engine_kwargs:
+      dynamo:
+        thunderagent:
+          enabled: true
+          router_block_size: 16
+        # Sleep/wake the engine around the training phase. verl's own
+        # rollout.free_cache_engine defaults to true; the server validates the
+        # two stay aligned (a contradiction fails at startup) — the engine
+        # staying resident through training OOMs the trainer.
+        free_engine_on_train: true
+        # Remaining keys optional; sane defaults applied in DynamoHttpServer.
+        # engine: vllm                  # vllm | sglang
+        # request_completion_token_ids: true  # REQUIRED for RL; sglang refuses to start when unset
+        # namespace: verl_dynamo
+        # router_mode: kv               # round-robin | kv | random | least-loaded
+        # frontend_http_port: 0         # 0 = auto-assign on master node
+        # etcd_port: 0                  # 0 = auto-assign
+        # etcd_peer_port: 0             # 0 = auto-assign
+        # nats_port: 0                  # 0 = auto-assign
+        # served_model_name: <str>      # falls back to model_config.local_path
+        # enable_kv_events: true        # --kv-events-config on every shard, both engines
+        #                               # (false for round-robin, where they are pure overhead)
+        # router_session_affinity_ttl_secs: 600  # frontend session affinity keyed on the
+        #                               # trajectory request id; unset = off
+        # sglang:
+        #   attention_backend: flashinfer  # sglang's own Hopper default (fa3) is ~8% slower
+        #                               # with the router page size
+
+trainer:
+  project_name: verl-dynamo
+
+# Forward the driver registration to workers on pre-started Ray clusters.
+# Use a literal: main_ppo passes runtime_env to Ray before resolving config.
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      env_vars:
+        VERL_USE_EXTERNAL_MODULES: recipe.dynamo.register
